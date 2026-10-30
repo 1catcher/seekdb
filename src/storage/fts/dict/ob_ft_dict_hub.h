@@ -17,8 +17,10 @@
 #ifndef _OCEANBASE_STORAGE_FTS_DICT_OB_FT_DICT_HUB_H_
 #define _OCEANBASE_STORAGE_FTS_DICT_OB_FT_DICT_HUB_H_
 
+#include "lib/allocator/page_arena.h"
 #include "lib/charset/ob_charset.h"
 #include "lib/lock/ob_bucket_lock.h"
+#include "lib/lock/ob_mutex.h"
 #include "storage/fts/dict/ob_ft_dict_def.h"
 
 namespace oceanbase
@@ -93,6 +95,20 @@ private:
 };
 
 class ObFTCacheRangeContainer;
+class ObFTRangeDict;
+class ObIFTDict;
+
+struct ObSharedRangeDict
+{
+  ObSharedRangeDict()
+      : type_(ObFTDictType::DICT_TYPE_INVALID), container_(nullptr), dict_(nullptr)
+  {
+  }
+  ObFTDictType type_;
+  ObFTCacheRangeContainer *container_;
+  ObFTRangeDict *dict_;
+};
+
 class ObFTDictHub
 {
 public:
@@ -107,6 +123,8 @@ public:
 
   int load_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container);
 
+  int get_shared_range_dict(const ObFTDictDesc &desc, ObIFTDict *&dict);
+
 private:
   int get_dict_info(const ObFTDictInfoKey &key, ObFTDictInfo &info);
 
@@ -118,6 +136,10 @@ private:
   // holds info of dict
   hash::ObHashMap<ObFTDictInfoKey, ObFTDictInfo> dict_map_;
   ObBucketLock rw_dict_lock_;
+  // range dicts built once and shared by all tokenize calls
+  lib::ObMutex shared_dict_lock_;
+  common::ObArenaAllocator shared_dict_arena_;
+  ObSharedRangeDict shared_dicts_[static_cast<int64_t>(ObFTDictType::DICT_TYPE_MAX)];
 };
 
 } //  namespace storage

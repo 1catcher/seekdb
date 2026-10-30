@@ -18,6 +18,9 @@
 #include "storage/fts/ob_fts_struct.h"
 #define USING_LOG_PREFIX STORAGE_FTS
 
+#include "lib/atomic/ob_atomic.h"
+#include "lib/lock/ob_mutex.h"
+
 #include "storage/fts/ob_fts_parser_helper.h"
 
 #include "common/json_type/ob_json_tree.h"
@@ -255,6 +258,166 @@ int ObFTParseData::get_dict_hub(ObFTDictHub *&hub)
 
 ////////////////////////////////////////////////////////////////////////////////
 // ObFTParseHelper
+
+namespace {
+
+constexpr int64_t PARSER_INIT_CACHE_SLOT_CNT = 8;
+constexpr int64_t PARSER_INIT_CACHE_PROPS_SIZE = 512;
+
+// Caches the parse result of (parser_name, parser_properties) so repeated
+// init on the same config (e.g. per-row TOKENIZE) skips the per-call JSON
+// parse. All cached values have value semantics (ObFTParserName owns an
+// inline char[], property ObStrings point to static literals, desc_ is a
+// static singleton), so a plain copy on the hit path is safe. A slot is
+// filled exactly once and published with a release-store of ready_.
+struct ParserInitCacheEntry
+{
+  ParserInitCacheEntry()
+      : ready_(0),
+        name_len_(0),
+        props_len_(0),
+        parser_(),
+        property_(),
+        desc_(nullptr),
+        add_word_flag_()
+  {
+    MEMSET(name_buf_, 0, sizeof(name_buf_));
+    MEMSET(props_buf_, 0, sizeof(props_buf_));
+  }
+  int32_t ready_;
+  char name_buf_[OB_FT_PARSER_NAME_LENGTH];
+  char props_buf_[PARSER_INIT_CACHE_PROPS_SIZE];
+  int32_t name_len_;
+  int32_t props_len_;
+  ObFTParser parser_;
+  ObFTParserProperty property_;
+  const ObIFTParserDesc *desc_;
+  ObAddWordFlag add_word_flag_;
+};
+
+ParserInitCacheEntry g_parser_init_cache[PARSER_INIT_CACHE_SLOT_CNT];
+lib::ObMutex g_parser_init_cache_lock_;
+
+const ParserInitCacheEntry *find_parser_init_cache(
+    const common::ObString &parser_name,
+    const common::ObString &parser_properties)
+{
+  if (parser_name.length() >= OB_FT_PARSER_NAME_LENGTH
+      || parser_properties.length() > PARSER_INIT_CACHE_PROPS_SIZE) {
+    return nullptr;
+  }
+  for (int64_t i = 0; i < PARSER_INIT_CACHE_SLOT_CNT; ++i) {
+    const ParserInitCacheEntry &entry = g_parser_init_cache[i];
+    if (1 == ATOMIC_LOAD_ACQ(&entry.ready_)
+        && entry.name_len_ == parser_name.length()
+        && entry.props_len_ == parser_properties.length()
+        && 0 == MEMCMP(entry.name_buf_, parser_name.ptr(), entry.name_len_)
+        && (0 == entry.props_len_
+            || 0 == MEMCMP(entry.props_buf_, parser_properties.ptr(), entry.props_len_))) {
+      return &entry;
+    }
+  }
+  return nullptr;
+}
+
+void store_to_parser_init_cache(
+    const common::ObString &parser_name,
+    const common::ObString &parser_properties,
+    const ObFTParser &parser,
+    const ObFTParserProperty &property,
+    const ObIFTParserDesc *desc,
+    const ObAddWordFlag &add_word_flag)
+{
+  if (parser_name.length() >= OB_FT_PARSER_NAME_LENGTH
+      || parser_properties.length() > PARSER_INIT_CACHE_PROPS_SIZE) {
+    return;
+  }
+  lib::ObMutexGuard guard(g_parser_init_cache_lock_);
+  if (OB_NOT_NULL(find_parser_init_cache(parser_name, parser_properties))) {
+    return;
+  }
+  for (int64_t i = 0; i < PARSER_INIT_CACHE_SLOT_CNT; ++i) {
+    ParserInitCacheEntry &entry = g_parser_init_cache[i];
+    if (0 == ATOMIC_LOAD_ACQ(&entry.ready_)) {
+      MEMCPY(entry.name_buf_, parser_name.ptr(), parser_name.length());
+      entry.name_len_ = static_cast<int32_t>(parser_name.length());
+      if (parser_properties.length() > 0) {
+        MEMCPY(entry.props_buf_, parser_properties.ptr(), parser_properties.length());
+      }
+      entry.props_len_ = static_cast<int32_t>(parser_properties.length());
+      entry.parser_ = parser;
+      entry.property_ = property;
+      entry.desc_ = desc;
+      entry.add_word_flag_ = add_word_flag;
+      ATOMIC_STORE_REL(&entry.ready_, 1);
+      break;
+    }
+  }
+}
+
+} // anonymous namespace
+
+ObFTParseHelper::ObFTParseHelper()
+    : allocator_(nullptr),
+    parser_desc_(nullptr),
+    parser_name_(),
+    add_word_flag_(),
+    parser_property_(),
+    is_inited_(false)
+{
+}
+
+ObFTParseHelper::~ObFTParseHelper()
+{
+  reset();
+}
+
+int ObFTParseHelper::init(
+    common::ObIAllocator *allocator,
+    const common::ObString &parser_name,
+    const common::ObString &parser_properties)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(is_inited_)) {
+    ret = OB_INIT_TWICE;
+  } else if (OB_ISNULL(allocator) || OB_UNLIKELY(parser_name.empty())) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    const ParserInitCacheEntry *cache_entry = find_parser_init_cache(parser_name, parser_properties);
+    if (OB_NOT_NULL(cache_entry)) {
+      parser_name_ = cache_entry->parser_;
+      parser_property_ = cache_entry->property_;
+      parser_desc_ = cache_entry->desc_;
+      add_word_flag_ = cache_entry->add_word_flag_;
+      allocator_ = allocator;
+      is_inited_ = true;
+    } else if (OB_FAIL(parser_name_.parse_from_str(parser_name.ptr(), parser_name.length()))) {
+    } else if (OB_FAIL(parser_property_.parse_for_parser_helper(parser_name_, parser_properties))) {
+    } else if (OB_FAIL(parser_name_.get_desc(parser_desc_))) {
+    } else if (OB_ISNULL(parser_desc_)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(set_add_word_flag(*parser_desc_))) {
+    } else {
+      allocator_ = allocator;
+      is_inited_ = true;
+      store_to_parser_init_cache(
+          parser_name, parser_properties, parser_name_, parser_property_, parser_desc_, add_word_flag_);
+    }
+  }
+  if (OB_FAIL(ret) && OB_UNLIKELY(!is_inited_)) {
+    reset();
+  }
+  return ret;
+}
+
+void ObFTParseHelper::reset()
+{
+  parser_desc_ = nullptr;
+  allocator_ = nullptr;
+  add_word_flag_.clear();
+  is_inited_ = false;
+}
+
 int ObFTParseHelper::segment(
     const ObFTParserProperty &property,
     const int64_t parser_version,
@@ -307,55 +470,6 @@ int ObFTParseHelper::segment(
     }
   }
   return ret;
-}
-
-ObFTParseHelper::ObFTParseHelper()
-    : allocator_(nullptr),
-    parser_desc_(nullptr),
-    parser_name_(),
-    add_word_flag_(),
-    parser_property_(),
-    is_inited_(false)
-{
-}
-
-ObFTParseHelper::~ObFTParseHelper()
-{
-  reset();
-}
-
-int ObFTParseHelper::init(
-    common::ObIAllocator *allocator,
-    const common::ObString &parser_name,
-    const common::ObString &parser_properties)
-{
-  int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(is_inited_)) {
-    ret = OB_INIT_TWICE;
-  } else if (OB_ISNULL(allocator) || OB_UNLIKELY(parser_name.empty())) {
-    ret = OB_INVALID_ARGUMENT;
-  } else if (OB_FAIL(parser_name_.parse_from_str(parser_name.ptr(), parser_name.length()))) {
-  } else if (OB_FAIL(parser_property_.parse_for_parser_helper(parser_name_, parser_properties))) {
-  } else if (OB_FAIL(parser_name_.get_desc(parser_desc_))) {
-  } else if (OB_ISNULL(parser_desc_)) {
-    ret = OB_ERR_UNEXPECTED;
-  } else if (OB_FAIL(set_add_word_flag(*parser_desc_))) {
-  } else {
-    allocator_ = allocator;
-    is_inited_ = true;
-  }
-  if (OB_FAIL(ret) && OB_UNLIKELY(!is_inited_)) {
-    reset();
-  }
-  return ret;
-}
-
-void ObFTParseHelper::reset()
-{
-  parser_desc_ = nullptr;
-  allocator_ = nullptr;
-  add_word_flag_.clear();
-  is_inited_ = false;
 }
 
 int ObFTParseHelper::segment(

@@ -55,6 +55,7 @@ enum class ObFTDictType : uint32_t
   DICT_IK_MAIN = 1,
   DICT_IK_QUAN = 2,
   DICT_IK_STOP = 3,
+  DICT_TYPE_MAX = 4,
 };
 
 class ObFTDictDesc

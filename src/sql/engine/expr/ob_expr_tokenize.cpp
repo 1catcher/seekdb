@@ -18,7 +18,9 @@
 
 #include "lib/alloc/alloc_struct.h"
 #include "lib/allocator/page_arena.h"
+#include "lib/atomic/ob_atomic.h"
 #include "lib/charset/ob_charset.h"
+#include "lib/lock/ob_mutex.h"
 #include "common/json_type/ob_json_base.h"
 #include "common/json_type/ob_json_tree.h"
 #include "lib/ob_errno.h"
@@ -39,6 +41,93 @@ namespace oceanbase
 {
 namespace sql
 {
+
+namespace {
+
+constexpr int64_t TOKENIZE_REFORM_CACHE_SLOT_CNT = 8;
+constexpr int64_t TOKENIZE_REFORM_CACHE_IN_SIZE = 512;
+constexpr int64_t TOKENIZE_REFORM_CACHE_OUT_SIZE = 1024;
+
+// reform_parser_properties builds the same normalized properties JSON for the
+// same (parser_name, input properties) on every TOKENIZE call. Cache the
+// output bytes: a slot is filled once under a mutex and published with a
+// release-store of ready_. The returned ObString then points at immutable
+// static memory, which is only read during the current call.
+struct TokenizeReformCacheEntry
+{
+  TokenizeReformCacheEntry()
+      : ready_(0), name_len_(0), in_len_(0), out_len_(0)
+  {
+    MEMSET(name_buf_, 0, sizeof(name_buf_));
+    MEMSET(in_buf_, 0, sizeof(in_buf_));
+    MEMSET(out_buf_, 0, sizeof(out_buf_));
+  }
+  int32_t ready_;
+  char name_buf_[storage::OB_FT_PARSER_NAME_LENGTH];
+  char in_buf_[TOKENIZE_REFORM_CACHE_IN_SIZE];
+  char out_buf_[TOKENIZE_REFORM_CACHE_OUT_SIZE];
+  int32_t name_len_;
+  int32_t in_len_;
+  int32_t out_len_;
+};
+
+TokenizeReformCacheEntry g_tokenize_reform_cache[TOKENIZE_REFORM_CACHE_SLOT_CNT];
+lib::ObMutex g_tokenize_reform_cache_lock_;
+
+const TokenizeReformCacheEntry *find_tokenize_reform_cache(
+    const common::ObString &parser_name,
+    const common::ObString &in_props)
+{
+  if (parser_name.length() >= storage::OB_FT_PARSER_NAME_LENGTH
+      || in_props.length() > TOKENIZE_REFORM_CACHE_IN_SIZE) {
+    return nullptr;
+  }
+  for (int64_t i = 0; i < TOKENIZE_REFORM_CACHE_SLOT_CNT; ++i) {
+    const TokenizeReformCacheEntry &entry = g_tokenize_reform_cache[i];
+    if (1 == ATOMIC_LOAD_ACQ(&entry.ready_)
+        && entry.name_len_ == parser_name.length()
+        && entry.in_len_ == in_props.length()
+        && 0 == MEMCMP(entry.name_buf_, parser_name.ptr(), entry.name_len_)
+        && (0 == entry.in_len_ || 0 == MEMCMP(entry.in_buf_, in_props.ptr(), entry.in_len_))) {
+      return &entry;
+    }
+  }
+  return nullptr;
+}
+
+void store_tokenize_reform_cache(
+    const common::ObString &parser_name,
+    const common::ObString &in_props,
+    const common::ObString &out_props)
+{
+  if (parser_name.length() >= storage::OB_FT_PARSER_NAME_LENGTH
+      || in_props.length() > TOKENIZE_REFORM_CACHE_IN_SIZE
+      || out_props.length() > TOKENIZE_REFORM_CACHE_OUT_SIZE) {
+    return;
+  }
+  lib::ObMutexGuard guard(g_tokenize_reform_cache_lock_);
+  if (OB_NOT_NULL(find_tokenize_reform_cache(parser_name, in_props))) {
+    return;
+  }
+  for (int64_t i = 0; i < TOKENIZE_REFORM_CACHE_SLOT_CNT; ++i) {
+    TokenizeReformCacheEntry &entry = g_tokenize_reform_cache[i];
+    if (0 == ATOMIC_LOAD_ACQ(&entry.ready_)) {
+      MEMCPY(entry.name_buf_, parser_name.ptr(), parser_name.length());
+      entry.name_len_ = static_cast<int32_t>(parser_name.length());
+      if (in_props.length() > 0) {
+        MEMCPY(entry.in_buf_, in_props.ptr(), in_props.length());
+      }
+      entry.in_len_ = static_cast<int32_t>(in_props.length());
+      MEMCPY(entry.out_buf_, out_props.ptr(), out_props.length());
+      entry.out_len_ = static_cast<int32_t>(out_props.length());
+      ATOMIC_STORE_REL(&entry.ready_, 1);
+      break;
+    }
+  }
+}
+
+} // anonymous namespace
+
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
     : ObStringExprOperator(alloc,
                            T_FUN_TOKENIZE,
@@ -375,15 +464,22 @@ int ObExprTokenize::parse_parser_properties(const ObExpr &expr,
 int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &properties)
 {
   int ret = OB_SUCCESS;
-  storage::ObFTParserJsonProps parser_properties;
+  const TokenizeReformCacheEntry *cache_entry = find_tokenize_reform_cache(parser_name_, properties);
+  if (OB_NOT_NULL(cache_entry)) {
+    properties_ = ObString(cache_entry->out_len_, cache_entry->out_buf_);
+  } else {
+    storage::ObFTParserJsonProps parser_properties;
 
-  if (OB_FAIL(parser_properties.init())) {
-  } else if (OB_FAIL(parser_properties.parse_from_valid_str(properties))) {
-    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "parser properties invalid.");
-  } else if (OB_FAIL(parser_properties.rebuild_props_for_ddl(parser_name_,
-                                                             ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                                                             true))) {
-  } else if (OB_FAIL(parser_properties.to_format_json(allocator_, properties_))) {
+    if (OB_FAIL(parser_properties.init())) {
+    } else if (OB_FAIL(parser_properties.parse_from_valid_str(properties))) {
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "parser properties invalid.");
+    } else if (OB_FAIL(parser_properties.rebuild_props_for_ddl(parser_name_,
+                                                               ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                                                               true))) {
+    } else if (OB_FAIL(parser_properties.to_format_json(allocator_, properties_))) {
+    } else {
+      store_tokenize_reform_cache(parser_name_, properties, properties_);
+    }
   }
 
   return ret;

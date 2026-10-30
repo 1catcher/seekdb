@@ -115,6 +115,52 @@ int ObFTDictHub::load_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &c
 }
 
 
+int ObFTDictHub::get_shared_range_dict(const ObFTDictDesc &desc, ObIFTDict *&dict)
+{
+  int ret = OB_SUCCESS;
+  dict = nullptr;
+  if (!is_inited_) {
+    ret = OB_NOT_INIT;
+  } else if (OB_UNLIKELY(desc.type_ <= ObFTDictType::DICT_TYPE_INVALID
+                         || desc.type_ >= ObFTDictType::DICT_TYPE_MAX)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    ObSharedRangeDict &slot = shared_dicts_[static_cast<int64_t>(desc.type_)];
+    lib::ObMutexGuard guard(shared_dict_lock_);
+    if (OB_NOT_NULL(slot.dict_)) {
+      dict = slot.dict_;
+    } else {
+      ObFTCacheRangeContainer *container = nullptr;
+      ObFTRangeDict *range_dict = nullptr;
+      if (OB_ISNULL(container = OB_NEWx(ObFTCacheRangeContainer,
+                                        &shared_dict_arena_,
+                                        shared_dict_arena_))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else if (OB_FAIL(load_cache(desc, *container))) {
+        if (OB_ENTRY_NOT_EXIST == ret) {
+          if (OB_FAIL(build_cache(desc, *container))) {
+          }
+        }
+      }
+      if (OB_FAIL(ret)) {
+      } else if (OB_ISNULL(range_dict = OB_NEWx(ObFTRangeDict,
+                                                &shared_dict_arena_,
+                                                shared_dict_arena_,
+                                                container,
+                                                desc))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else if (OB_FAIL(range_dict->init())) {
+      } else {
+        slot.type_ = desc.type_;
+        slot.container_ = container;
+        slot.dict_ = range_dict;
+        dict = range_dict;
+      }
+    }
+  }
+  return ret;
+}
+
 int ObFTDictHub::get_dict_info(const ObFTDictInfoKey &key, ObFTDictInfo &info)
 {
   int ret = OB_SUCCESS;
